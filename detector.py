@@ -2,6 +2,7 @@
 import queue
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -182,23 +183,57 @@ class PotholeDetector:
         # Smoothed FPS — initialised to 0 until first inference runs
         self._fps_ema: float = 0.0
 
-        # Hooks for future extensibility (WhatsApp bot, GPS tracking, road hazard alerts)
+        # Generic per-frame hooks (unused by default; nothing is registered unless you add it)
         self._alert_handlers: List[Callable[[DetectionResult, np.ndarray], None]] = []
 
         self.model: Optional[YOLO] = None
         self._load_model()
 
+    PRETRAINED_MODEL_URL = (
+        "https://huggingface.co/peterhdd/pothole-detection-yolov8/"
+        "resolve/main/best.pt"
+    )
+
     def _load_model(self) -> None:
-        """Load YOLO model weights and transfer to optimal compute device."""
+        """Load weights; download PeterHdd's pretrained model for the default path if absent."""
         if not self.model_path.is_file():
-            raise FileNotFoundError(
-                f"Model weights not found at: {self.model_path}\n"
-                f"Please ensure 'pothole.pt' is placed inside '{config.MODELS_DIR}' directory."
-            )
+            is_default_path = self.model_path.resolve() == config.DEFAULT_MODEL_PATH.resolve()
+            if is_default_path:
+                self.model_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = self.model_path.with_suffix(self.model_path.suffix + ".download")
+                print(
+                    "[INFO] PeterHdd pothole weights not found. Downloading pretrained "
+                    "YOLOv8s model from Hugging Face (one-time download)..."
+                )
+                try:
+                    urllib.request.urlretrieve(self.PRETRAINED_MODEL_URL, str(temp_path))
+                    if not temp_path.is_file() or temp_path.stat().st_size < 1_000_000:
+                        raise RuntimeError("Downloaded weights file is missing or unexpectedly small.")
+                    temp_path.replace(self.model_path)
+                    print(f"[INFO] Pretrained model saved to: {self.model_path}")
+                except Exception as e:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise RuntimeError(
+                        "Could not download PeterHdd's pretrained pothole model. "
+                        "Check your internet connection or manually download best.pt from "
+                        "https://huggingface.co/peterhdd/pothole-detection-yolov8 and save it as "
+                        f"'{self.model_path}'. Original error: {e}"
+                    ) from e
+            else:
+                raise FileNotFoundError(
+                    f"Model weights not found at: {self.model_path}\n"
+                    "Set a valid model path or use the default model path to download "
+                    "the PeterHdd pretrained model automatically."
+                )
 
         try:
             self.model = YOLO(str(self.model_path))
             self.model.to(self.device)
+            print(f"[INFO] Loaded pothole model: {self.model_path}")
+            print(f"[INFO] Inference device: {self.device_name}")
         except Exception as e:
             raise RuntimeError(f"Failed to load YOLO model from '{self.model_path}': {e}") from e
 
@@ -206,7 +241,6 @@ class PotholeDetector:
         """Register a callback triggered on every frame that has detections.
 
         Use this to attach external modules without modifying the core engine:
-            - WhatsApp / Telegram alerts
             - GPS coordinate tagging
             - Hazard database writes
 
@@ -368,7 +402,6 @@ class PotholeDetector:
         show_hud: bool = True,
         total_count: Optional[int] = None,
         override_fps: Optional[float] = None,
-        whatsapp_msg: Optional[str] = None,
         critical_id: Optional[int] = None,
         rhi: Optional[int] = None,
         total_logged: int = 0,
@@ -381,7 +414,6 @@ class PotholeDetector:
             show_hud:     Render the translucent top HUD banner.
             total_count:  Total unique potholes (active + logged).
             override_fps: Custom FPS to display (overrides result.fps).
-            whatsapp_msg: Optional WhatsApp dispatch message for bottom bar.
             critical_id:  track_id of the largest pothole (gets map-pin).
             rhi:          Road Health Index 0-100 (None = not computed yet).
             total_logged: Number of permanently logged unique potholes.
@@ -607,25 +639,6 @@ class PotholeDetector:
                             (bar_x - rw - 6, bar_y + bar_h),
                             font, 0.48, rhi_col, 1, cv2.LINE_AA)
 
-            # ---- WhatsApp alert bar (bottom) ----
-            if whatsapp_msg:
-                msg_scale = 0.50
-                (mw, mh), _ = cv2.getTextSize(whatsapp_msg, font, msg_scale, 2)
-                bar3_h = 34
-                bar3_w = mw + 32
-                bar3_x = max(margin, (width - bar3_w) // 2)
-                bar3_y = height - margin - bar3_h
-                cv2.rectangle(annotated,
-                              (bar3_x, bar3_y),
-                              (bar3_x + bar3_w, bar3_y + bar3_h),
-                              (14, 38, 18), -1)
-                cv2.rectangle(annotated,
-                              (bar3_x, bar3_y),
-                              (bar3_x + bar3_w, bar3_y + bar3_h),
-                              (40, 210, 80), 2)
-                cv2.putText(annotated, whatsapp_msg,
-                            (bar3_x + 16, bar3_y + 22),
-                            font, msg_scale, (210, 255, 210), 2, cv2.LINE_AA)
 
         return annotated
 

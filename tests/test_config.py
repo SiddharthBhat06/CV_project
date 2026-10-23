@@ -18,9 +18,3 @@ def test_depth_scale_constants():
     assert config.DEPTH_NEAR_SCALE == 1.0
     assert config.DEPTH_FAR_SCALE < config.DEPTH_NEAR_SCALE
 
-
-def test_whatsapp_config_defaults():
-    assert isinstance(config.WHATSAPP_ENABLED, bool)
-    assert config.WHATSAPP_PORT == 5005
-    assert config.WHATSAPP_MIN_SEVERITY in ("Low", "Medium", "High")
-    assert config.WHATSAPP_COOLDOWN_SECONDS > 0

@@ -12,16 +12,16 @@ class Config:
     OUTPUTS_DIR: Path = BASE_DIR / "outputs"
 
     # Model configuration
-    DEFAULT_MODEL_PATH: Path = MODELS_DIR / "pothole.pt"
+    DEFAULT_MODEL_PATH: Path = MODELS_DIR / "pothole_yolo.pt"
     MODEL_PATH: Path = Path(os.getenv("POTHOLE_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
 
     # Detection thresholds
-    CONFIDENCE_THRESHOLD: float = float(os.getenv("POTHOLE_CONFIDENCE_THRESHOLD", "0.35"))
+    CONFIDENCE_THRESHOLD: float = float(os.getenv("POTHOLE_CONFIDENCE_THRESHOLD", "0.25"))
     IOU_THRESHOLD: float = float(os.getenv("POTHOLE_IOU_THRESHOLD", "0.45"))
     # Image size used for YOLO inference. Override via: POTHOLE_IMG_SIZE=640
     IMAGE_SIZE: int = int(os.getenv("POTHOLE_IMG_SIZE", "0"))  # 0 = auto-select by device
     CPU_IMAGE_SIZE: int = int(os.getenv("POTHOLE_CPU_IMG_SIZE", "416"))
-    GPU_IMAGE_SIZE: int = int(os.getenv("POTHOLE_GPU_IMG_SIZE", "640"))
+    GPU_IMAGE_SIZE: int = int(os.getenv("POTHOLE_GPU_IMG_SIZE", "832"))
 
 
     # Target processing & playback FPS for video mode (15 FPS max as configured).
@@ -94,14 +94,6 @@ class Config:
     DEFAULT_FPS: int = int(os.getenv("POTHOLE_DEFAULT_FPS", "13"))
     DEFAULT_CAMERA_INDEX: int = 0
     WINDOW_TITLE: str = "AI Pothole Detection System (Press Q to quit)"
-
-    # WhatsApp Automated Municipal Alert System
-    WHATSAPP_ENABLED: bool = os.getenv("POTHOLE_WHATSAPP_ENABLED", "1").lower() in ("1", "true", "yes")
-    WHATSAPP_AUTHORITY_PHONE: str = os.getenv("POTHOLE_AUTHORITY_PHONE", "+919591152862")
-    WHATSAPP_PORT: int = int(os.getenv("POTHOLE_WHATSAPP_PORT", "5005"))
-    WHATSAPP_MIN_SEVERITY: str = os.getenv("POTHOLE_WHATSAPP_MIN_SEVERITY", "Low")
-    WHATSAPP_COOLDOWN_SECONDS: float = float(os.getenv("POTHOLE_WHATSAPP_COOLDOWN", "15.0"))
-
 
     def __init__(self):
         """Ensure runtime directories exist."""
