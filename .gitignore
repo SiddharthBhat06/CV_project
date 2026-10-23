@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Outputs & uploads (generated at runtime)
+outputs/
+uploads/
+
+# Model weights (large binary files — download separately)
+models/*.pt
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# WhatsApp Bot Microservice
+whatsapp_bot/node_modules/
+whatsapp_bot/.wwebjs_auth/
+whatsapp_bot/.wwebjs_cache/
+
