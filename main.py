@@ -14,12 +14,17 @@ Two ways to use it:
       python main.py --ui          # shortcut that launches the line above
 """
 import argparse
+import base64
+import html
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -27,11 +32,16 @@ import cv2
 import numpy as np
 
 # Streamlit / pandas are only needed for the web UI; the CLI works without them.
+# Keep these imports independent: a missing pandas installation must not replace
+# an otherwise valid Streamlit module with ``None``.
 try:
     import pandas as pd
-    import streamlit as st
-except ImportError:  # pragma: no cover
+except ImportError:  # pragma: no cover - optional CLI dependency
     pd = None
+
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover - optional CLI dependency
     st = None
 
 from config import config
@@ -716,6 +726,110 @@ class _UIStreamSession:
         self.fps_history: list = []
         self.last_result = None
         self.tracks: dict = {}
+        # Best annotated frame per pothole (JPEG bytes) + the most recent view,
+        # so camera/video runs can be downloaded just like the Image tab.
+        self.snapshots: dict = {}
+        self._untracked_last = -999
+        self._last_annotated = None
+
+    _MAX_SNAPSHOTS = 60
+
+    def _capture_snapshots(self, annotated: np.ndarray, result) -> None:
+        """Keep the best-confidence annotated frame for each tracked pothole."""
+        jpg = None
+        for d in result.detections:
+            if d.track_id is None:
+                # Tracker unavailable: throttle to one snapshot per 15 frames.
+                if self.frame_idx - self._untracked_last < 15:
+                    continue
+                key = f"f{self.frame_idx}"
+                self._untracked_last = self.frame_idx
+            else:
+                key = d.track_id
+            prev = self.snapshots.get(key)
+            if prev is None and len(self.snapshots) >= self._MAX_SNAPSHOTS:
+                continue
+            if prev is not None and d.confidence < prev["conf"] + 0.05:
+                continue
+            if jpg is None:
+                ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if not ok:
+                    return
+                jpg = buf.tobytes()
+            self.snapshots[key] = dict(
+                key=key, conf=d.confidence, tier=d.tier, frame=self.frame_idx, jpg=jpg,
+            )
+
+    @staticmethod
+    def _snapshot_name(snap: dict) -> str:
+        label = f"id{snap['key']}" if isinstance(snap["key"], int) else "untracked"
+        return f"pothole_{label}_frame{snap['frame']}_conf{int(snap['conf'] * 100)}.jpg"
+
+    def _build_zip(self, snaps: list, table, last_frame: Optional[bytes] = None) -> Optional[bytes]:
+        """Bundle all snapshots (and the CSV table) into one in-memory ZIP."""
+        if not snaps and not last_frame:
+            return None
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+            for snap in snaps:
+                zf.writestr(self._snapshot_name(snap), snap["jpg"])
+            if last_frame:
+                zf.writestr("last_frame.png", last_frame)
+            if not table.empty:
+                zf.writestr("potholes_summary.csv", table.to_csv(index=False))
+        return buf.getvalue()
+
+    _REPORT_CSS = (
+        "body{font-family:Helvetica,Arial,sans-serif;margin:32px;color:#14181f;background:#f4f1ea}"
+        "h1{margin:0 0 4px}h2{margin-top:32px}.meta{color:#5b636e}"
+        ".cards{display:flex;gap:16px;flex-wrap:wrap;margin:20px 0}"
+        ".card{background:#fff;border:1px solid #e0dcd2;border-radius:12px;padding:14px 20px}"
+        ".card b{display:block;font-size:26px;color:#c2410c}"
+        "table{border-collapse:collapse;background:#fff;width:100%}"
+        "th,td{border:1px solid #e0dcd2;padding:6px 10px;text-align:left;font-size:14px}"
+        "th{background:#14181f;color:#f4f1ea}"
+        ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}"
+        "figure{margin:0;background:#fff;border:1px solid #e0dcd2;border-radius:12px;padding:10px}"
+        "figure img{width:100%;border-radius:8px}figcaption{font-size:14px;margin-top:6px}"
+    )
+
+    def _build_report(self, table, snaps: list, avg_fps: float) -> str:
+        """Self-contained HTML report (open in a browser; print to save as PDF)."""
+        e = html.escape
+        stats = [
+            ("Frames processed", self.frame_idx),
+            ("Unique potholes", self.registry.total_unique_count),
+            ("Total detections", self.instances),
+            ("Highest confidence", f"{self.registry.max_confidence * 100:.1f}%"),
+            ("Average FPS", f"{avg_fps:.1f}"),
+        ]
+        cards = "".join(f'<div class="card">{e(k)}<b>{e(str(v))}</b></div>' for k, v in stats)
+        table_html = (
+            table.to_html(index=False, border=0, escape=True)
+            if not table.empty else "<p>No potholes were tracked in this run.</p>"
+        )
+        figs = ""
+        for snap in snaps:
+            b64 = base64.b64encode(snap["jpg"]).decode("ascii")
+            label = f"#{snap['key']}" if isinstance(snap["key"], int) else "untracked"
+            figs += (
+                f'<figure><img alt="pothole {e(label)}" src="data:image/jpeg;base64,{b64}">'
+                f'<figcaption>{e(label)} · {e(str(snap["tier"]))} · '
+                f'{snap["conf"] * 100:.0f}% · frame {snap["frame"]}</figcaption></figure>'
+            )
+        images = f'<div class="grid">{figs}</div>' if figs else "<p>No snapshots captured.</p>"
+        return (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<title>Pothole detection report</title>"
+            f"<style>{self._REPORT_CSS}</style></head><body>"
+            "<h1>Pothole Detection Report</h1>"
+            f"<p class='meta'>Source: {e(self.source_name)} · Generated "
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M')}</p>"
+            f"<div class='cards'>{cards}</div>"
+            f"<h2>Pothole table</h2>{table_html}"
+            f"<h2>Captured images</h2>{images}"
+            "</body></html>"
+        )
 
     def process(self, frame: np.ndarray):
         """Detect (honouring frame-skip), track and annotate one frame."""
@@ -752,6 +866,10 @@ class _UIStreamSession:
             rhi=rhi,
             total_logged=self.registry.unique_logged_count,
         )
+
+        if fresh:
+            self._capture_snapshots(annotated, result)
+        self._last_annotated = annotated
 
         inst_fps = 1.0 / max(1e-4, time.perf_counter() - t0)
         self.fps = inst_fps if self.fps == 0.0 else 0.1 * inst_fps + 0.9 * self.fps
@@ -798,7 +916,27 @@ class _UIStreamSession:
     def summary(self, **extra) -> dict:
         table = pd.DataFrame(sorted(self.tracks.values(), key=lambda r: r["Track ID"]))
         avg_fps = sum(self.fps_history) / len(self.fps_history) if self.fps_history else 0.0
+        snaps = sorted(self.snapshots.values(), key=lambda x: x["frame"])
+        last_frame = None
+        if self._last_annotated is not None:
+            ok, png = cv2.imencode(".png", self._last_annotated)
+            last_frame = png.tobytes() if ok else None
+        zip_bytes = report = None
+        errors: list = []
+        try:
+            zip_bytes = self._build_zip(snaps, table, last_frame)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"images ZIP: {exc!r}")
+        try:
+            report = self._build_report(table, snaps, avg_fps)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"report: {exc!r}")
         return dict(
+            build_errors=errors,
+            snapshots=snaps,
+            snapshots_zip=zip_bytes,
+            report_html=report,
+            last_frame=last_frame,
             source=self.source_name,
             frames=self.frame_idx,
             unique=self.registry.total_unique_count,
@@ -809,6 +947,55 @@ class _UIStreamSession:
             log_path=str(config.OUTPUTS_DIR / "detection_log.jsonl") if self.settings["save_log"] else None,
             **extra,
         )
+
+
+def _ui_ensure_summary(state_key: str, session_key: str) -> None:
+    """(Re)build a run's summary from the saved session when it is missing or stale."""
+    sess = st.session_state.get(session_key)
+    if sess is None or getattr(sess, "frame_idx", 0) <= 0:
+        return
+    old = st.session_state.get(state_key)
+    if old and old.get("frames", 0) >= sess.frame_idx:
+        return
+    try:
+        new = sess.summary()
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Could not build the summary for this run: {exc!r}")
+        return
+    if old:  # keep video output info the end-of-run step stored
+        for k in ("video_path", "playable"):
+            if k in old:
+                new[k] = old[k]
+    st.session_state[state_key] = new
+
+
+def _ui_download_row(state_key: str, disabled: bool = False, key_suffix: str = "done") -> None:
+    """'Download report' / 'Download images' buttons for a finished run."""
+    s = st.session_state.get(state_key) or {}
+    live = bool(s) and not disabled
+    c1, c2, _ = st.columns([1, 1, 3])
+    c1.download_button(
+        "📄 Download report", s.get("report_html") or "",
+        file_name=f"pothole_report_{state_key}.html", mime="text/html",
+        disabled=not (live and s.get("report_html")), key=f"rep_{state_key}_{key_suffix}",
+    )
+    c2.download_button(
+        "🖼️ Download images", s.get("snapshots_zip") or b"",
+        file_name=f"pothole_images_{state_key}.zip", mime="application/zip",
+        disabled=not (live and s.get("snapshots_zip")), key=f"imgzip_{state_key}_{key_suffix}",
+    )
+    if disabled:
+        st.caption("Running… press the **Stop** button in this tab to finish and unlock the downloads. "
+                   "(The Streamlit Stop at the top-right only halts the script.)")
+    elif not s:
+        st.caption("Report and images become available after a run finishes.")
+    else:
+        st.caption(
+            f"Last run: {s.get('frames', 0)} frames · "
+            f"{len(s.get('snapshots') or [])} snapshots captured."
+        )
+        for err in s.get("build_errors") or []:
+            st.warning(f"Could not build {err}")
 
 
 def _ui_show_summary(state_key: str) -> None:
@@ -848,6 +1035,34 @@ def _ui_show_summary(state_key: str) -> None:
             "⬇️ Download pothole table (CSV)", table.to_csv(index=False),
             file_name="potholes_summary.csv", mime="text/csv", key=f"csv_{state_key}",
         )
+
+    snaps = s.get("snapshots") or []
+    if snaps or s.get("last_frame"):
+        st.subheader("Images")
+        b1, _ = st.columns(2)
+        if s.get("last_frame"):
+            b1.download_button(
+                "⬇️ Download last annotated frame", s["last_frame"],
+                file_name=f"last_frame_{state_key}.png", mime="image/png",
+                key=f"last_{state_key}",
+            )
+    if snaps:
+        with st.expander(f"Captured pothole snapshots ({len(snaps)})", expanded=True):
+            cols = st.columns(3)
+            for i, snap in enumerate(snaps):
+                col = cols[i % 3]
+                label = f"#{snap['key']}" if isinstance(snap["key"], int) else "untracked"
+                col.image(
+                    snap["jpg"],
+                    caption=f"{label} · {snap['tier']} · {snap['conf'] * 100:.0f}% · frame {snap['frame']}",
+                    use_container_width=True,
+                )
+                col.download_button(
+                    "⬇️ Download", snap["jpg"],
+                    file_name=_UIStreamSession._snapshot_name(snap), mime="image/jpeg",
+                    key=f"snap_{state_key}_{i}",
+                )
+
     if s.get("log_path"):
         st.caption(f"Event log: `{s['log_path']}`")
 
@@ -881,6 +1096,7 @@ def _ui_run_video(uploaded, detector: PotholeDetector, settings: dict) -> None:
     )
 
     session = _UIStreamSession(detector, settings, uploaded.name)
+    st.session_state["video_session"] = session
     st.session_state.pop("video_summary", None)
 
     metrics_ph = st.empty()
@@ -939,13 +1155,15 @@ def _ui_run_webcam(cam_idx: int, detector: PotholeDetector, settings: dict) -> N
         return
 
     session = _UIStreamSession(detector, settings, f"webcam:{cam_idx}")
+    st.session_state["webcam_session"] = session
     st.session_state.pop("webcam_summary", None)
 
     metrics_ph = st.empty()
     frame_ph = st.empty()
-    st.caption("Live — switch **Start camera** off to stop.")
+    st.caption("Live — press **⏹ Stop camera** to end the run and get your downloads.")
 
     failures = 0
+    last_save = time.perf_counter()
     try:
         while True:
             ret, frame = cap.read()
@@ -962,6 +1180,10 @@ def _ui_run_webcam(cam_idx: int, detector: PotholeDetector, settings: dict) -> N
             if session.frame_idx % settings["preview_every"] == 0:
                 frame_ph.image(session.preview(annotated), channels="RGB", use_container_width=True)
                 session.render_metrics(metrics_ph, result, rhi)
+            # Save progress regularly so Stop never loses the report.
+            if time.perf_counter() - last_save > 3.0:
+                st.session_state["webcam_summary"] = session.summary()
+                last_save = time.perf_counter()
     finally:
         cap.release()
         st.session_state["webcam_summary"] = session.summary()
@@ -992,8 +1214,14 @@ def _ui_tab_video(detector, settings) -> None:
     start = c1.button("▶️ Start", type="primary", disabled=uploaded is None, key="vid_start")
     c2.button("⏹ Stop", key="vid_stop", help="Ends processing early and keeps the output so far.")
 
+    row_ph = st.empty()
     if start and uploaded is not None:
+        with row_ph.container():
+            _ui_download_row("video_summary", disabled=True, key_suffix="live")
         _ui_run_video(uploaded, detector, settings)
+    _ui_ensure_summary("video_summary", "video_session")
+    with row_ph.container():
+        _ui_download_row("video_summary", key_suffix="done")
     _ui_show_summary("video_summary")
 
 
@@ -1013,8 +1241,23 @@ def _ui_tab_camera(detector, settings) -> None:
             "Camera device index", min_value=0, max_value=10,
             value=int(config.DEFAULT_CAMERA_INDEX), step=1,
         )
-        if st.toggle("Start camera", key="cam_run"):
+        c1, c2, _ = st.columns([1, 1, 4])
+        if c1.button("▶️ Start camera", type="primary", key="cam_start"):
+            st.session_state["cam_running"] = True
+        if c2.button("⏹ Stop camera", key="cam_stop",
+                     help="Ends the live view and shows downloads for this run."):
+            st.session_state["cam_running"] = False
+        row_ph = st.empty()
+        if st.session_state.get("cam_running"):
+            with row_ph.container():
+                _ui_download_row("webcam_summary", disabled=True, key_suffix="live")
             _ui_run_webcam(int(cam_idx), detector, settings)
+            # Only reached if the loop ended by itself (e.g. camera error);
+            # a Stop click interrupts the loop and reruns the script instead.
+            st.session_state["cam_running"] = False
+        _ui_ensure_summary("webcam_summary", "webcam_session")
+        with row_ph.container():
+            _ui_download_row("webcam_summary", key_suffix="done")
         _ui_show_summary("webcam_summary")
     else:
         photo = st.camera_input("Take a picture of the road")
@@ -1033,6 +1276,16 @@ def _ui_tab_camera(detector, settings) -> None:
 
 def run_streamlit_app() -> None:
     """Entry point for the Streamlit frontend."""
+    if st is None:
+        raise RuntimeError(
+            "The Streamlit frontend requires Streamlit. Install it with "
+            "`pip install streamlit` and run `streamlit run main.py`."
+        )
+    if pd is None:
+        raise RuntimeError(
+            "The Streamlit frontend requires pandas. Install it with "
+            "`pip install pandas`."
+        )
     st.set_page_config(page_title="AI Pothole Detection", page_icon="🕳️", layout="wide")
     st.title("🕳️ AI Pothole Detection System")
     st.caption("YOLO + ByteTrack detection with civil-engineering metrics.")
